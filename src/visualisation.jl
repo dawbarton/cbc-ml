@@ -13,6 +13,12 @@ using SavitzkyGolay: savitzky_golay
 
 DEFAULT_FIGURE_SIZE::Tuple{Int, Int} = (800, 600)
 
+"""
+    plot_forcing(data; size = DEFAULT_FIGURE_SIZE)
+
+Plot the response surface of the data provided by plotting the triple (forcing
+frequency, forcing amplitude, response amplitude).
+"""
 function plot_surface(data; size = DEFAULT_FIGURE_SIZE)
     forcing_freq = [pt.forcing_freq for run in data for pt in run]
     forcing_amp = [pt.out_amp for run in data for pt in run]
@@ -23,10 +29,24 @@ function plot_surface(data; size = DEFAULT_FIGURE_SIZE)
     return fig
 end
 
-function plot_manifold_dxdt(data; window = 21, rand = false, base = false)
+"""
+    plot_manifold_dxdt(data; window = 21, rand = false, base = false)
+
+Plot the manifold that all the data lies on; plots `x(t)` vs `dx/dt` vs `u(t)`,
+where `dx/dt` is the derivative of `x(t)`. The derivative is calculated using a
+Savitzky-Golay filter with a specified window size.
+
+The `rand` argument specifies whether to use the random perturbation data, and
+`base` specifies whether to use the base data instead of the output data. The
+`window` argument specifies the size of the Savitzky-Golay filter window.
+"""
+function plot_manifold_dxdt(data; window = 21, rand = false, base = false, size = DEFAULT_FIGURE_SIZE)
     x = Float64[]
     dxdt = Float64[]
     u = Float64[]
+    if data isa Vector{Measurement}
+        data = [data]
+    end
     half_window = (window - 1) ÷ 2
     for run in data
         for pt in run
@@ -44,16 +64,29 @@ function plot_manifold_dxdt(data; window = 21, rand = false, base = false)
         end
     end
     @show length(x)
-    fig = Figure(size = DEFAULT_FIGURE_SIZE)
+    fig = Figure(; size)
     ax = Axis3(fig[1, 1], title = "Manifold Plot", xlabel = "x", ylabel = "dx/dt", zlabel = "u")
-    scatter!(ax, x, dxdt, u)
+    scatter!(ax, x, dxdt, u; fxaa = true, alpha = 0.1)
     return fig
 end
 
-function plot_manifold_delay(data; delay = 75, rand = false, base = false)
+"""
+    plot_manifold_delay(data; delay = 75, rand = false, base = false)
+
+Plot the manifold that all the data lies on; plots `x(t)` vs `x(t-τ)` vs `u(t)`,
+where `τ` is the delay.
+
+The `rand` argument specifies whether to use the random perturbation data, and
+`base` specifies whether to use the base data instead of the output data. The
+`window` argument specifies the size of the Savitzky-Golay filter window.
+"""
+function plot_manifold_delay(data; delay = 75, rand = false, base = false, size = DEFAULT_FIGURE_SIZE)
     x = Float64[]
     xtau = Float64[]
     u = Float64[]
+    if data isa Vector{Measurement}
+        data = [data]
+    end
     for run in data
         for pt in run
             if rand
@@ -69,7 +102,7 @@ function plot_manifold_delay(data; delay = 75, rand = false, base = false)
         end
     end
     @show length(x)
-    fig = Figure(size = DEFAULT_FIGURE_SIZE)
+    fig = Figure(; size)
     ax = Axis3(fig[1, 1], title = "Manifold Plot", xlabel = "x(t)", ylabel = "x(t-τ)", zlabel = "u(t)")
     scatter!(ax, x, xtau, u; fxaa = true, alpha = 0.1)
     return fig
