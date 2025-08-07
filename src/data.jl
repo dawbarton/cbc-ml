@@ -78,7 +78,7 @@ struct Measurement
 end
 
 function Base.show(io::IO, pt::Union{Measurement, RandomMeasurement})
-    if get(io, :compact, true)::Bool
+    return if get(io, :compact, true)::Bool
         print(io, "$(typeof(pt))(…)")
     else
         invoke(Base.show, Tuple{IO, Any}, io, pt)
@@ -92,7 +92,7 @@ function Base.show(io::IO, ::MIME"text/plain", pt::Union{Measurement, RandomMeas
         show(io, getfield(pt, name))
         print(io, "\n")
     end
-    print(io, ")")
+    return print(io, ")")
 end
 
 function load_from(rawdata)
@@ -131,7 +131,7 @@ function load_from(rawdata)
                 vec(run_data["mass"][i]),
                 vec(run_data["force"][i]),
                 vec(run_data["out"][i]),
-                vec(run_data["rand_out"][i]),
+                haskey(run_data, "rand_out") ? vec(run_data["rand_out"][i]) : Float64[],
                 rand_perturb,
                 vec(run_data["timestamp"][i]),
                 run_data["x_amp"][i],
