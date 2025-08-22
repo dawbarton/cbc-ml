@@ -51,10 +51,10 @@ parameter specifies the number of latent variables in the neural network, and
 `width` specifies the width of the hidden layers. The `rng` parameter is used
 for initializing the model parameters.
 """
-function create_model(; dt, latent = 8, width = 64, rng = Random.default_rng())
+function create_model(; dt, controls = 1, latent = 8, width = 64, rng = Random.Xoshiro(123))
     model = EulerStepper(
         Chain(
-            Dense(2 + latent => width, gelu),
+            Dense(1 + controls + latent => width, gelu),
             Dense(width => width, gelu),
             Dense(width => width, gelu),
             LayerNorm(width),
@@ -66,16 +66,22 @@ function create_model(; dt, latent = 8, width = 64, rng = Random.default_rng())
     return (; model, ps, st)
 end
 
-function create_scalings(data::Vector{Measurement}; batchsize = 32, latent = 8, diff_window = 4)
-    # Find the linear term of a least squares fit through the first diff_window points of x;
-    # approximates the derivative at t=0 (NOTE: should be scaled by 1/dt to get the correct scaling)
-    least_sqrs = pinv([ones(diff_window);; collect(1:diff_window)])[2, :]
-    # Create the dataset
-    x = reshape(reduce(hcat, [[pt.rand_perturb.x[1]; dot(least_sqrs, pt.rand_perturb.x[1:diff_window]); zeros(latent - 1)] for pt in data]), (1 + latent, length(data)))
-    u = reshape(reduce(hcat, [pt.rand_perturb.out[1:(end - 1)] for pt in data]), (1, :, length(data)))
-    y = reshape(reduce(hcat, [pt.rand_perturb.x[2:end] for pt in data]), (1, :, length(data)))
-    dydt = diff(y; dims = 2)
-    return (x, u, y, dydt)
+function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0, timespan = :, opt_state = nothing)
+    train_state = Training.TrainState(model, ps, st, AdamW(lr))
+    if opt_state !== nothing
+        @set! train_state.optimizer_state = opt_state
+    end
+    for iteration in 1:epochs
+        for (i, (x_i, u_i, y_i)) in enumerate(dataloader)
+            _, loss, _, train_state = Training.single_train_step!(
+                AutoEnzyme(), MSELoss(), ((x_i, u_i[:, timespan, :]), y_i[:, timespan, :]), train_state
+            )
+            if (iteration % print_every == 0 || iteration == 1) && i == 1
+                @printf("Iter: [%4d/%4d]\tLoss: %.8f\n", iteration, epochs, loss)
+            end
+        end
+    end
+    return train_state
 end
 
 function create_dataloader_rand(data::Vector{Measurement}; batchsize = 1, latent = 8, diff_window = 4, step = 1)
@@ -107,24 +113,6 @@ function create_dataloader_rand(data::Vector{Measurement}; batchsize = 1, latent
     dataset = (; x, u, y)
     # Return the dataloader
     return DataLoader(dataset; batchsize, partial = true, shuffle = true), scalings
-end
-
-function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0, timespan = :, opt_state = nothing)
-    train_state = Training.TrainState(model, ps, st, AdamW(lr))
-    if opt_state !== nothing
-        @set! train_state.optimizer_state = opt_state
-    end
-    for iteration in 1:epochs
-        for (i, (x_i, u_i, y_i)) in enumerate(dataloader)
-            _, loss, _, train_state = Training.single_train_step!(
-                AutoEnzyme(), MSELoss(), ((x_i, u_i[:, timespan, :]), y_i[:, timespan, :]), train_state
-            )
-            if (iteration % print_every == 0 || iteration == 1) && i == 1
-                @printf("Iter: [%4d/%4d]\tLoss: %.8f\n", iteration, epochs, loss)
-            end
-        end
-    end
-    return train_state
 end
 
 function dostuff(dataloader, dt; latent = 8, skip = 1, kwargs...)
