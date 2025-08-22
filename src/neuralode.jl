@@ -1,11 +1,12 @@
-using Lux: Lux, LuxCore, Training, AutoEnzyme, MSELoss, Chain, Dense, LayerNorm, AbstractLuxLayer, AbstractLuxWrapperLayer, gelu
+using Lux: Lux, LuxCore, Training, AutoEnzyme, MSELoss, Chain, Dense, LayerNorm, AbstractLuxLayer, AbstractLuxWrapperLayer, gelu, @set!
 using Random: Random
-using Optimisers: Optimisers, Adam
+using Optimisers: Optimisers, Adam, AdamW
 using Reactant: Reactant, @trace, Const
 using Enzyme: Enzyme
 using MLUtils: MLUtils, DataLoader
 using Printf: @printf
 using LinearAlgebra: LinearAlgebra, pinv, dot
+using Statistics: mean, std
 
 const rdev = Lux.reactant_device()
 const cdev = Lux.cpu_device()
@@ -65,7 +66,7 @@ function create_model(; dt, latent = 8, width = 64, rng = Random.default_rng())
     return (; model, ps, st)
 end
 
-function create_dataloader_rand(data::Vector{Measurement}; batchsize = 32, latent = 8, diff_window = 4)
+function create_scalings(data::Vector{Measurement}; batchsize = 32, latent = 8, diff_window = 4)
     # Find the linear term of a least squares fit through the first diff_window points of x;
     # approximates the derivative at t=0 (NOTE: should be scaled by 1/dt to get the correct scaling)
     least_sqrs = pinv([ones(diff_window);; collect(1:diff_window)])[2, :]
@@ -73,17 +74,50 @@ function create_dataloader_rand(data::Vector{Measurement}; batchsize = 32, laten
     x = reshape(reduce(hcat, [[pt.rand_perturb.x[1]; dot(least_sqrs, pt.rand_perturb.x[1:diff_window]); zeros(latent - 1)] for pt in data]), (1 + latent, length(data)))
     u = reshape(reduce(hcat, [pt.rand_perturb.out[1:(end - 1)] for pt in data]), (1, :, length(data)))
     y = reshape(reduce(hcat, [pt.rand_perturb.x[2:end] for pt in data]), (1, :, length(data)))
-    dataset = (; x, u, y)
-    # Return the dataloader
-    return DataLoader(dataset; batchsize, partial = true, shuffle = true)
+    dydt = diff(y; dims = 2)
+    return (x, u, y, dydt)
 end
 
-function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0)
-    train_state = Training.TrainState(model, ps, st, Adam(lr))
+function create_dataloader_rand(data::Vector{Measurement}; batchsize = 1, latent = 8, diff_window = 4, step = 1)
+    # This code effectively assumes that the time step between each data point
+    # is 1 unit of time; since the data (including time derivatives) get
+    # standardised, the original (physical) time step is irrelevant
+
+    # x is the initial condition, which is taken as [x(0), dx/dt(0), zeros for remaining latent variables]
+    # u is the external input to the system
+    # y is the full data series (ground truth)
+
+    # Find the linear term of a least squares fit through the first diff_window
+    # points of x; approximates the derivative at t=0 (NOTE: should be scaled by
+    # SAMPLE_FREQ to get the correct physical scaling)
+    least_sqrs = pinv([ones(diff_window);; collect(1:diff_window)])[2, :]
+    # Create the dataset
+    x = convert(Array{Float32}, reshape(reduce(hcat, [[pt.rand_perturb.x[1]; dot(least_sqrs, pt.rand_perturb.x[1:diff_window]); zeros(latent - 1)] for pt in data]), (1 + latent, length(data))))
+    u = convert(Array{Float32}, reshape(reduce(hcat, [pt.rand_perturb.out[1:step:(end - 1)] for pt in data]), (1, :, length(data))))
+    y = convert(Array{Float32}, reshape(reduce(hcat, [pt.rand_perturb.x[2:step:end] for pt in data]), (1, :, length(data))))
+    # Standardise the data
+    x_scale = (μ = mean(y), σ = std(y))  # use y because it contains (almost) the entire time series
+    u_scale = (μ = mean(u), σ = std(u))
+    u .= (u .- u_scale.μ) ./ u_scale.σ
+    y .= (y .- x_scale.μ) ./ x_scale.σ
+    dt = std(diff(y; dims = 2))
+    x[1, :, :] .= (x[1, :, :] .- x_scale.μ) ./ x_scale.σ
+    x[2, :, :] .= x[2, :, :] ./ (x_scale.σ * dt)
+    scalings = (; x_scale, u_scale, dt)
+    dataset = (; x, u, y)
+    # Return the dataloader
+    return DataLoader(dataset; batchsize, partial = true, shuffle = true), scalings
+end
+
+function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0, timespan = :, opt_state = nothing)
+    train_state = Training.TrainState(model, ps, st, AdamW(lr))
+    if opt_state !== nothing
+        @set! train_state.optimizer_state = opt_state
+    end
     for iteration in 1:epochs
         for (i, (x_i, u_i, y_i)) in enumerate(dataloader)
             _, loss, _, train_state = Training.single_train_step!(
-                AutoEnzyme(), MSELoss(), ((x_i, u_i), y_i), train_state
+                AutoEnzyme(), MSELoss(), ((x_i, u_i[:, timespan, :]), y_i[:, timespan, :]), train_state
             )
             if (iteration % print_every == 0 || iteration == 1) && i == 1
                 @printf("Iter: [%4d/%4d]\tLoss: %.8f\n", iteration, epochs, loss)
@@ -93,10 +127,29 @@ function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, 
     return train_state
 end
 
-function dostuff(dataloader; latent = 8, kwargs...)
+function dostuff(dataloader, dt; latent = 8, skip = 1, kwargs...)
     # Create the model
-    rng = Random.default_rng(1234)
-    (model, ps, st) = create_model(; dt = Float32(1 / SAMPLE_FREQ), rng, latent)
+    rng = Random.Xoshiro(1234)
+    (model, ps, st) = create_model(; dt, rng, latent, kwargs...)
+    dataloader_ra = rdev(dataloader)
+    # Training schedules
+    schedules = [
+        (100, 1:(200 ÷ skip), 0.001f0),
+        (100, 1:(400 ÷ skip), 0.001f0),
+        (100, 1:(600 ÷ skip), 0.001f0),
+        (100, 1:(800 ÷ skip), 0.001f0),
+        (100, 1:(1200 ÷ skip), 0.001f0),
+        (200, 1:(2400 ÷ skip), 0.0005f0),
+        (200, 1:(4800 ÷ skip), 0.0005f0),
+        (400, :, 0.0005f0),
+    ]
     # Train the model
-    return train_model(model, rdev(ps), rdev(st), rdev(dataloader); kwargs...)
+    sc, remaining = Iterators.peel(schedules)
+    println(sc)
+    ts = train_model(model, rdev(ps), rdev(st), dataloader_ra; epochs = sc[1], timespan = sc[2], lr = sc[3])
+    for sc in remaining
+        println(sc)
+        ts = train_model(ts.model, ts.parameters, ts.states, dataloader_ra; opt_state = ts.optimizer_state, epochs = sc[1], timespan = sc[2], lr = sc[3])
+    end
+    return ts
 end
