@@ -4,9 +4,10 @@ using Optimisers: Optimisers, Adam, AdamW
 using Reactant: Reactant, @trace, Const
 using Enzyme: Enzyme
 using MLUtils: MLUtils, DataLoader
-using Printf: @printf
+using Printf: @printf, @sprintf
 using LinearAlgebra: LinearAlgebra, pinv, dot
 using Statistics: mean, std
+using Serialization: serialize
 
 const rdev = Lux.reactant_device()
 const cdev = Lux.cpu_device()
@@ -66,25 +67,35 @@ function create_model(; dt, controls = 1, latent = 8, width = 64, rng = Random.X
     return (; model, ps, st)
 end
 
-function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0, timespan = :, opt_state = nothing)
+function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0, timespan = :, opt_state = nothing, io = nothing)
     train_state = Training.TrainState(model, ps, st, AdamW(lr))
     if opt_state !== nothing
         @set! train_state.optimizer_state = opt_state
     end
+    best_loss = typemax(Float32)
+    best_ps = train_state.parameters
+    best_opt = train_state.optimizer_state
     for iteration in 1:epochs
         for (i, (x_i, u_i, y_i)) in enumerate(dataloader)
             _, loss, _, train_state = Training.single_train_step!(
                 AutoEnzyme(), MSELoss(), ((x_i, u_i[:, timespan, :]), y_i[:, timespan, :]), train_state
             )
+            if loss < best_loss
+                best_ps = cdev(train_state.parameters)
+                best_opt = cdev(train_state.optimizer_state)
+                best_loss = loss
+            end
             if (iteration % print_every == 0 || iteration == 1) && i == 1
-                @printf("Iter: [%4d/%4d]\tLoss: %.8f\n", iteration, epochs, loss)
+                logmsg = @sprintf("Iter: [%4d/%4d]\tLoss: %.8f\t(Best loss: %.8f)", iteration, epochs, loss, best_loss)
+                println(logmsg)
+                (io !== nothing) && (println(io, logmsg); flush(io))
             end
         end
     end
-    return train_state
+    return best_ps, best_opt
 end
 
-function create_dataloader_rand(data::Vector{Measurement}; batchsize = 1, latent = 8, diff_window = 4, step = 1)
+function create_dataloader_rand(data::Vector{Measurement}; batchsize = 256, latent = 8, diff_window = 4, step = 1, split = 1)
     # This code effectively assumes that the time step between each data point
     # is 1 unit of time; since the data (including time derivatives) get
     # standardised, the original (physical) time step is irrelevant
@@ -97,10 +108,12 @@ function create_dataloader_rand(data::Vector{Measurement}; batchsize = 1, latent
     # points of x; approximates the derivative at t=0 (NOTE: should be scaled by
     # SAMPLE_FREQ to get the correct physical scaling)
     least_sqrs = pinv([ones(diff_window);; collect(1:diff_window)])[2, :]
+    x_all = convert(Array{Float32}, reshape(reduce(hcat, [pt.rand_perturb.x[1:step:end] for pt in data]), (:, length(data) * split)))
+    u_all = convert(Array{Float32}, reshape(reduce(hcat, [pt.rand_perturb.out[1:step:end] for pt in data]), (:, length(data) * split)))
     # Create the dataset
-    x = convert(Array{Float32}, reshape(reduce(hcat, [[pt.rand_perturb.x[1]; dot(least_sqrs, pt.rand_perturb.x[1:diff_window]); zeros(latent - 1)] for pt in data]), (1 + latent, length(data))))
-    u = convert(Array{Float32}, reshape(reduce(hcat, [pt.rand_perturb.out[1:step:(end - 1)] for pt in data]), (1, :, length(data))))
-    y = convert(Array{Float32}, reshape(reduce(hcat, [pt.rand_perturb.x[2:step:end] for pt in data]), (1, :, length(data))))
+    x = [x_all[1, :]'; least_sqrs' * x_all[1:diff_window, :]; zeros(Float32, latent - 1, size(x_all, 2))]
+    u = reshape(u_all[1:(end - 1), :], (1, :, size(u_all, 2)))
+    y = reshape(x_all[2:end, :], (1, :, size(x_all, 2)))
     # Standardise the data
     x_scale = (μ = mean(y), σ = std(y))  # use y because it contains (almost) the entire time series
     u_scale = (μ = mean(u), σ = std(u))
@@ -112,32 +125,46 @@ function create_dataloader_rand(data::Vector{Measurement}; batchsize = 1, latent
     scalings = (; x_scale, u_scale, dt)
     dataset = (; x, u, y)
     # Return the dataloader
-    return DataLoader(dataset; batchsize, partial = true, shuffle = true), scalings
+    return DataLoader(dataset; batchsize, partial = false, shuffle = true), scalings
 end
 
-function dostuff(dataloader, dt; latent = 8, skip = 1, kwargs...)
+function dostuff(dataloader, dt; latent = 8, step = 1, output = nothing, kwargs...)
+    if output !== nothing
+        io = open(output * ".txt", "w")
+        println(io, "latent = $latent, dt = $dt, step = $step, u size = $(size(dataloader.data.u)), kwargs=$kwargs")
+        show(io, MIME("text/plain"), dataloader)
+    else
+        io = nothing
+    end
     # Create the model
     rng = Random.Xoshiro(1234)
     (model, ps, st) = create_model(; dt, rng, latent, kwargs...)
     dataloader_ra = rdev(dataloader)
     # Training schedules
     schedules = [
-        (100, 1:(200 ÷ skip), 0.001f0),
-        (100, 1:(400 ÷ skip), 0.001f0),
-        (100, 1:(600 ÷ skip), 0.001f0),
-        (100, 1:(800 ÷ skip), 0.001f0),
-        (100, 1:(1200 ÷ skip), 0.001f0),
-        (200, 1:(2400 ÷ skip), 0.0005f0),
-        (200, 1:(4800 ÷ skip), 0.0005f0),
-        (400, :, 0.0005f0),
+        (100, 1:(200 ÷ step), 0.001f0),
+        (100, 1:(400 ÷ step), 0.001f0),
+        (100, 1:(600 ÷ step), 0.001f0),
+        (100, 1:(800 ÷ step), 0.001f0),
+        (200, 1:(1200 ÷ step), 0.0005f0),
+        (400, :, 0.00025f0),
+        (400, :, 0.000125f0),
     ]
     # Train the model
     sc, remaining = Iterators.peel(schedules)
     println(sc)
-    ts = train_model(model, rdev(ps), rdev(st), dataloader_ra; epochs = sc[1], timespan = sc[2], lr = sc[3])
+    best_ps, best_opt = train_model(model, rdev(ps), rdev(st), dataloader_ra; epochs = sc[1], timespan = sc[2], lr = sc[3])
+    serialize(output * ".jls", (best_ps, best_opt))
     for sc in remaining
         println(sc)
-        ts = train_model(ts.model, ts.parameters, ts.states, dataloader_ra; opt_state = ts.optimizer_state, epochs = sc[1], timespan = sc[2], lr = sc[3])
+        if io !== nothing
+            println(io, sc)
+        end
+        best_ps, best_opt = train_model(model, rdev(best_ps), rdev(st), dataloader_ra; opt_state = rdev(best_opt), epochs = sc[1], timespan = sc[2], lr = sc[3], io)
+        serialize(output * ".jls", (best_ps, best_opt))
     end
-    return ts
+    if io !== nothing
+        close(io)
+    end
+    return best_ps, best_opt
 end
