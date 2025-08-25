@@ -56,8 +56,8 @@ function create_model(; dt, controls = 1, latent = 8, width = 64, rng = Random.X
     model = EulerStepper(
         Chain(
             Dense(1 + controls + latent => width, gelu),
-            Dense(width => width, gelu),
-            Dense(width => width, gelu),
+            # Dense(width => width, gelu),
+            # Dense(width => width, gelu),
             LayerNorm(width),
             Dense(width => 1 + latent)
         ),
@@ -67,8 +67,8 @@ function create_model(; dt, controls = 1, latent = 8, width = 64, rng = Random.X
     return (; model, ps, st)
 end
 
-function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0, timespan = :, opt_state = nothing, io = nothing)
-    train_state = Training.TrainState(model, ps, st, AdamW(lr))
+function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, lr = 0.001f0, timespan = :, opt_state = nothing, io = nothing, optimiser = AdamW)
+    train_state = Training.TrainState(model, ps, st, optimiser(lr))
     if opt_state !== nothing
         @set! train_state.optimizer_state = opt_state
     end
@@ -81,8 +81,8 @@ function train_model(model, ps, st, dataloader; epochs = 100, print_every = 10, 
                 AutoEnzyme(), MSELoss(), ((x_i, u_i[:, timespan, :]), y_i[:, timespan, :]), train_state
             )
             if loss < best_loss
-                best_ps = cdev(train_state.parameters)
-                best_opt = cdev(train_state.optimizer_state)
+                best_ps = Lux.fmap(copy, train_state.parameters)
+                best_opt = Lux.fmap(copy, train_state.optimizer_state)
                 best_loss = loss
             end
             if (iteration % print_every == 0 || iteration == 1) && i == 1
@@ -143,28 +143,51 @@ function dostuff(dataloader, dt; latent = 8, step = 1, output = nothing, kwargs.
     # Training schedules
     schedules = [
         (100, 1:(200 ÷ step), 0.001f0),
-        (100, 1:(400 ÷ step), 0.001f0),
-        (100, 1:(600 ÷ step), 0.001f0),
-        (100, 1:(800 ÷ step), 0.001f0),
-        (200, 1:(1200 ÷ step), 0.0005f0),
-        (400, :, 0.00025f0),
+        (100, 1:(400 ÷ step), 0.0005f0),
+        (100, 1:(600 ÷ step), 0.0005f0),
+        (100, 1:(800 ÷ step), 0.00025f0),
+        (200, 1:(1200 ÷ step), 0.000125f0),
         (400, :, 0.000125f0),
+        (400, :, 0.0000625f0),
     ]
     # Train the model
     sc, remaining = Iterators.peel(schedules)
     println(sc)
     best_ps, best_opt = train_model(model, rdev(ps), rdev(st), dataloader_ra; epochs = sc[1], timespan = sc[2], lr = sc[3])
-    serialize(output * ".jls", (best_ps, best_opt))
+    serialize(output * ".jls", (cdev(best_ps), cdev(best_opt)))
     for sc in remaining
         println(sc)
         if io !== nothing
             println(io, sc)
         end
-        best_ps, best_opt = train_model(model, rdev(best_ps), rdev(st), dataloader_ra; opt_state = rdev(best_opt), epochs = sc[1], timespan = sc[2], lr = sc[3], io)
-        serialize(output * ".jls", (best_ps, best_opt))
+        best_ps, best_opt = train_model(model, best_ps, rdev(st), dataloader_ra; opt_state = best_opt, epochs = sc[1], timespan = sc[2], lr = sc[3], io)
+        serialize(output * ".jls", (cdev(best_ps), cdev(best_opt)))
     end
     if io !== nothing
         close(io)
     end
+    return best_ps, best_opt
+end
+
+function dostuff2(data; run, latent = 4, width = 64, batchsize = 256, split = 10, epochs = 500, timespan = :, lr = 0.001f0, optimiser = AdamW, rng = Random.Xoshiro(1234))
+    # Create the dataloader
+    dataloader, scaling = create_dataloader_rand(data; latent, split, batchsize)
+    # Logging
+    io = open(run * ".txt", "w")
+    println(io, "data length = $(length(data))")
+    println(io, "run = $run")
+    println(io, "latent = $latent")
+    println(io, "width = $width")
+    println(io, "batchsize = $batchsize")
+    println(io, "split = $split")
+    println(io, "epochs = $epochs")
+    println(io, "timespan = $timespan")
+    println(io, "lr = $lr")
+    println(io, "optimiser = $optimiser")
+    # Create the model
+    (model, ps, st) = create_model(; scaling.dt, rng, latent, width)
+    best_ps, best_opt = train_model(model, rdev(ps), rdev(st), rdev(dataloader); epochs, timespan, lr, io)
+    serialize(run * ".jls", (cdev(best_ps), cdev(best_opt)))
+    close(io)
     return best_ps, best_opt
 end
